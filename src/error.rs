@@ -1,0 +1,54 @@
+use std::{error, io, path::PathBuf, sync::Arc};
+
+use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
+
+/// Extension trait for [`tantivy`]'s errors, to create an error from an [`io::Error`].
+pub trait WrapIoErrorExt: Sized {
+    /// Wraps the given [`io::Error`].
+    fn wrap(error: io::Error, path: impl Into<PathBuf>) -> Self;
+
+    /// Returns a closure that will wrap an error.
+    fn wrapper<E>(path: impl Into<PathBuf>) -> impl Fn(E) -> Self
+    where
+        E: Into<Box<dyn error::Error + Send + Sync>>,
+    {
+        let path = path.into();
+        move |error: E| {
+            let error = io::Error::other(error);
+            Self::wrap(error, path.clone())
+        }
+    }
+}
+
+impl WrapIoErrorExt for io::Error {
+    fn wrap(error: io::Error, _path: impl Into<PathBuf>) -> Self {
+        error
+    }
+}
+
+impl WrapIoErrorExt for OpenReadError {
+    fn wrap(error: io::Error, path: impl Into<PathBuf>) -> Self {
+        Self::IoError {
+            io_error: Arc::new(error),
+            filepath: path.into(),
+        }
+    }
+}
+
+impl WrapIoErrorExt for OpenWriteError {
+    fn wrap(error: io::Error, path: impl Into<PathBuf>) -> Self {
+        Self::IoError {
+            io_error: Arc::new(error),
+            filepath: path.into(),
+        }
+    }
+}
+
+impl WrapIoErrorExt for DeleteError {
+    fn wrap(error: io::Error, path: impl Into<PathBuf>) -> Self {
+        Self::IoError {
+            io_error: Arc::new(error),
+            filepath: path.into(),
+        }
+    }
+}

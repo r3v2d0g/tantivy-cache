@@ -1,0 +1,17 @@
+[package]
+name = "tantivy-cache"
+description = "tantivy caching for faster searching"
+version = "0.1.0"
+homepage = "https://github.com/r3v2d0g/tantivy-cache"
+documentation = "https://docs.rs/tantivy-cache"
+license = "MPL-2.0"
+authors = ["Matthieu (MLB) Le brazidec <r3v2d0g@jesus.gg>"]
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+deadpool-redis = "0.23"
+eyre = "0.6"
+tantivy = "0.25"
+tantivy-common = "0.10"
+tokio = "1.50"
