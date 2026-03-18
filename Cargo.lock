@@ -77,6 +77,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-on-place"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eea949e74877d876f5df420c331c841725b616a025edd7362f46175c18ca2fbc"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "bon"
 version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1249,6 +1258,7 @@ name = "tantivy-cache"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "block-on-place",
  "deadpool-redis",
  "eyre",
  "tantivy",

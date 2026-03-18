@@ -1,6 +1,7 @@
 use std::{io, ops::Range, path::Path, sync::Arc};
 
 use async_trait::async_trait;
+use block_on_place::HandleExt;
 use deadpool_redis::{Pool, redis::AsyncCommands};
 use eyre::Result;
 use tantivy::{
@@ -111,7 +112,7 @@ impl<D: Clone + Directory> Directory for CachingDirectory<D> {
         let file = self.dir.open_read(path)?;
         let handle = self
             .rt
-            .block_on(self.open(path, file))
+            .block_on_place(self.open(path, file))
             .map_err(OpenReadError::wrapper(path))?;
 
         Ok(Arc::new(handle))

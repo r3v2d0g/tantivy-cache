@@ -10,6 +10,7 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
+block-on-place = "0.1"
 deadpool-redis = "0.23"
 eyre = "0.6"
 tantivy = "0.25"
