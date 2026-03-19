@@ -34,14 +34,27 @@ struct CachingHandle {
     footer: Footer,
 }
 
-/// The footer that the `ManagedDirectory` used by `tantivy` reads when opening a
-/// file.
+/// The cached tail region of a file.
+///
+/// For all managed files, this includes the `ManagedDirectory` footer. For
+/// composite file types (`.idx`, `.pos`, `.term`), this also includes the
+/// `CompositeFile` footer which is read when opening a `SegmentReader`.
 #[derive(Debug)]
 struct Footer {
     data: OwnedBytes,
 
-    /// The offset of the footer within the file.
+    /// The offset of the cached region within the file.
     offset: usize,
+}
+
+/// Returns `true` if files at the given path have a `CompositeFile` footer that
+/// should be cached (i.e., they are segment files that are opened with
+/// `CompositeFile::open` when a `SegmentReader` is created).
+fn has_composite_footer(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("idx" | "pos" | "term")
+    )
 }
 
 impl<D> CachingDirectory<D> {
@@ -66,41 +79,47 @@ impl<D> CachingDirectory<D> {
         if let Some(data) = conn.get(&key).await? {
             let data: Vec<u8> = data;
             let data = OwnedBytes::new(data);
-
-            let end = data.len();
-            let start = end - 8;
-            let mut meta = &data[start..end];
-            let (len, _): (u32, u32) = meta.deserialize()?;
-
-            let offset = start - 8 - len as usize;
+            let offset = file.len() - data.len();
             let footer = Footer { data, offset };
 
             // TODO(MLB): cache in-memory as well?
             return Ok(CachingHandle { file, footer });
         }
 
-        let end = file.len();
-        let start = end - 8;
+        let file_len = file.len();
 
-        let meta = file.read_bytes_slice_async(start..end).await?;
-        let (len, _): (u32, u32) = meta.as_ref().deserialize()?;
+        // Read the managed directory footer metadata (last 8 bytes: footer_len
+        // + magic).
+        let md_meta = file
+            .read_bytes_slice_async((file_len - 8)..file_len)
+            .await?;
+        let (md_len, _): (u32, u32) = md_meta.as_ref().deserialize()?;
+        let md_start = file_len - 8 - md_len as usize;
 
-        let start = start - len as usize;
-        let end = end - 8;
-
-        let data = file.read_bytes_slice_async(start..end).await?;
-
-        let mut footer = Vec::with_capacity(len as usize + 8);
-        footer.extend_from_slice(data.as_ref());
-        footer.extend_from_slice(meta.as_ref());
-
-        let () = conn.set(key, &footer).await?;
-        let data = OwnedBytes::new(footer);
-
-        let footer = Footer {
-            data,
-            offset: start,
+        // For composite file types (.idx, .pos, .term), also cache the
+        // composite file footer which `CompositeFile::open` reads when opening
+        // a `SegmentReader`.
+        let offset = if has_composite_footer(path) {
+            let cf_meta = file
+                .read_bytes_slice_async((md_start - 4)..md_start)
+                .await?;
+            let cf_len: u32 = cf_meta.as_ref().deserialize()?;
+            md_start - 4 - cf_len as usize
+        } else {
+            md_start
         };
+
+        // Read and cache the entire footer region.
+        let body = file.read_bytes_slice_async(offset..(file_len - 8)).await?;
+
+        let mut cached = Vec::with_capacity(file_len - offset);
+        cached.extend_from_slice(body.as_ref());
+        cached.extend_from_slice(md_meta.as_ref());
+
+        let () = conn.set(&key, &cached).await?;
+        let data = OwnedBytes::new(cached);
+
+        let footer = Footer { data, offset };
 
         Ok(CachingHandle { file, footer })
     }
