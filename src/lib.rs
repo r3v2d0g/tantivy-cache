@@ -72,7 +72,7 @@ impl<D> CachingDirectory<D> {
             let mut meta = &data[start..end];
             let (len, _): (u32, u32) = meta.deserialize()?;
 
-            let offset = start - len as usize;
+            let offset = start - 8 - len as usize;
             let footer = Footer { data, offset };
 
             // TODO(MLB): cache in-memory as well?
