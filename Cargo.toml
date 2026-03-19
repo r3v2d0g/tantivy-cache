@@ -16,3 +16,8 @@ eyre = "0.6"
 tantivy = "0.25"
 tantivy-common = "0.10"
 tokio = "1.50"
+
+[dev-dependencies]
+testcontainers = "0.27.1"
+testcontainers-modules = { version = "0.15.0", features = ["redis"] }
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }

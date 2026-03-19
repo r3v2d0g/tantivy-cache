@@ -37,10 +37,12 @@ struct CachingHandle {
 /// The cached tail region of a file.
 ///
 /// For all managed files, this includes the `ManagedDirectory` footer. For
-/// composite file types (`.idx`, `.pos`, `.term`), this also includes the
-/// `CompositeFile` footer. For fast field files (`.fast`), this also includes
-/// the columnar footer, the SSTable footer, and the SSTable dictionary index.
-/// All of these are read eagerly when opening a `SegmentReader`.
+/// composite file types (`.idx`, `.pos`, `.term`, `.fieldnorm`), this also
+/// includes the `CompositeFile` footer. For fast field files (`.fast`), this
+/// also includes the columnar footer, the SSTable footer, and the SSTable
+/// dictionary index. For store files (`.store`), this also includes the
+/// `DocStoreFooter` and the skip/offset index. All of these are read eagerly
+/// when opening a `SegmentReader`.
 #[derive(Debug)]
 struct Footer {
     data: OwnedBytes,
@@ -55,7 +57,7 @@ struct Footer {
 fn has_composite_footer(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
-        Some("idx" | "pos" | "term")
+        Some("idx" | "pos" | "term" | "fieldnorm")
     )
 }
 
@@ -65,6 +67,14 @@ fn has_composite_footer(path: &Path) -> bool {
 /// created).
 fn has_columnar_footer(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("fast")
+}
+
+/// Returns `true` if files at the given path have a `DocStoreFooter` whose
+/// offset index should be cached (i.e., they are store files whose skip
+/// index is read by [`StoreReader::open`] when a [`SegmentReader`] is
+/// created).
+fn has_store_footer(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("store")
 }
 
 impl<D> CachingDirectory<D> {
@@ -106,13 +116,17 @@ impl<D> CachingDirectory<D> {
         let (md_len, _): (u32, u32) = md_meta.as_ref().deserialize()?;
         let md_start = file_len - 8 - md_len as usize;
 
-        // For composite file types (.idx, .pos, .term), also cache the
-        // composite file footer which `CompositeFile::open` reads when opening
-        // a `SegmentReader`.
+        // For composite file types (.idx, .pos, .term, .fieldnorm), also
+        // cache the composite file footer which `CompositeFile::open` reads
+        // when opening a `SegmentReader`.
         //
         // For fast field files (.fast), also cache the columnar footer, the
         // SSTable footer, and the SSTable dictionary index which
         // `ColumnarReader::open` and `Dictionary::open` read when opening a
+        // `SegmentReader`.
+        //
+        // For store files (.store), also cache the `DocStoreFooter` and the
+        // offset index which `StoreReader::open` reads when opening a
         // `SegmentReader`.
         let offset = if has_composite_footer(path) {
             let cf_meta = file
@@ -139,6 +153,19 @@ impl<D> CachingDirectory<D> {
             // Cache from the start of the SSTable index.
             let sstable_start = md_start - 20 - sstable_len as usize;
             sstable_start + index_offset as usize
+        } else if has_store_footer(path) {
+            // Read the `DocStoreFooter` (28 bytes before the managed footer
+            // body) and extract the `offset` field which points to the start
+            // of the offset/skip index.
+            let store_footer = file
+                .read_bytes_slice_async((md_start - 28)..md_start)
+                .await?;
+
+            // Parse `offset` (u64) at bytes 4..12 of the DocStoreFooter.
+            let mut buf = &store_footer[4..12];
+            let offset: u64 = buf.deserialize()?;
+
+            offset as usize
         } else {
             md_start
         };
@@ -292,3 +319,6 @@ impl HasLen for CachingHandle {
         self.file.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests;
