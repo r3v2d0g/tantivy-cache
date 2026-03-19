@@ -38,7 +38,9 @@ struct CachingHandle {
 ///
 /// For all managed files, this includes the `ManagedDirectory` footer. For
 /// composite file types (`.idx`, `.pos`, `.term`), this also includes the
-/// `CompositeFile` footer which is read when opening a `SegmentReader`.
+/// `CompositeFile` footer. For fast field files (`.fast`), this also includes
+/// the columnar footer, the SSTable footer, and the SSTable dictionary index.
+/// All of these are read eagerly when opening a `SegmentReader`.
 #[derive(Debug)]
 struct Footer {
     data: OwnedBytes,
@@ -55,6 +57,14 @@ fn has_composite_footer(path: &Path) -> bool {
         path.extension().and_then(|ext| ext.to_str()),
         Some("idx" | "pos" | "term")
     )
+}
+
+/// Returns `true` if files at the given path have a columnar footer that
+/// should be cached (i.e., they are fast field files whose SSTable dictionary
+/// index is read by [`ColumnarReader::open`] when a [`SegmentReader`] is
+/// created).
+fn has_columnar_footer(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("fast")
 }
 
 impl<D> CachingDirectory<D> {
@@ -99,12 +109,36 @@ impl<D> CachingDirectory<D> {
         // For composite file types (.idx, .pos, .term), also cache the
         // composite file footer which `CompositeFile::open` reads when opening
         // a `SegmentReader`.
+        //
+        // For fast field files (.fast), also cache the columnar footer, the
+        // SSTable footer, and the SSTable dictionary index which
+        // `ColumnarReader::open` and `Dictionary::open` read when opening a
+        // `SegmentReader`.
         let offset = if has_composite_footer(path) {
             let cf_meta = file
                 .read_bytes_slice_async((md_start - 4)..md_start)
                 .await?;
             let cf_len: u32 = cf_meta.as_ref().deserialize()?;
             md_start - 4 - cf_len as usize
+        } else if has_columnar_footer(path) {
+            // Read the columnar footer (20 bytes) and the SSTable footer
+            // (20 bytes) that precede the managed directory footer body, in
+            // one read.
+            let footers = file
+                .read_bytes_slice_async((md_start - 40)..md_start)
+                .await?;
+
+            // Parse `sstable_len` from the columnar footer (bytes 20..28).
+            let mut buf = &footers[20..28];
+            let sstable_len: u64 = buf.deserialize()?;
+
+            // Parse `index_offset` from the SSTable footer (bytes 0..8).
+            let mut buf = &footers[0..8];
+            let index_offset: u64 = buf.deserialize()?;
+
+            // Cache from the start of the SSTable index.
+            let sstable_start = md_start - 20 - sstable_len as usize;
+            sstable_start + index_offset as usize
         } else {
             md_start
         };
