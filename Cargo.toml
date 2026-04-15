@@ -16,6 +16,7 @@ eyre = "0.6"
 tantivy = "0.25"
 tantivy-common = "0.10"
 tokio = "1.50"
+tracing = "0.1"
 
 [dev-dependencies]
 testcontainers = "0.27.1"

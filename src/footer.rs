@@ -1,8 +1,12 @@
-use std::path::Path;
+use std::{
+    fmt::{self, Debug, Formatter},
+    path::Path,
+};
 
 use eyre::Result;
 use tantivy::{HasLen, directory::FileSlice};
 use tantivy_common::{DeserializeFrom, OwnedBytes};
+use tokio::sync::OnceCell;
 
 /// The cached tail region of a file.
 ///
@@ -13,9 +17,8 @@ use tantivy_common::{DeserializeFrom, OwnedBytes};
 /// dictionary index. For store files (`.store`), this also includes the
 /// `DocStoreFooter` and the skip/offset index. All of these are read eagerly
 /// when opening a `SegmentReader`.
-#[derive(Debug)]
 pub struct Footer {
-    pub data: OwnedBytes,
+    data: OnceCell<OwnedBytes>,
 
     /// The offset of the cached region within the file.
     pub offset: usize,
@@ -48,6 +51,13 @@ fn has_store_footer(path: &Path) -> bool {
 }
 
 impl Footer {
+    pub fn with_offset(offset: usize) -> Self {
+        Self {
+            data: OnceCell::new(),
+            offset,
+        }
+    }
+
     pub async fn read(path: &Path, file: &FileSlice) -> Result<Self> {
         let file_len = file.len();
 
@@ -119,8 +129,29 @@ impl Footer {
         let mut data = Vec::with_capacity(file_len - offset);
         data.extend_from_slice(body.as_ref());
         data.extend_from_slice(md_meta.as_ref());
+
         let data = OwnedBytes::new(data);
+        let data = OnceCell::new_with(Some(data));
 
         Ok(Footer { data, offset })
+    }
+
+    pub fn data(&self) -> Option<OwnedBytes> {
+        Some(self.data.get()?.clone())
+    }
+
+    pub async fn get_or_fetch(
+        &self,
+        fetch: impl Future<Output = Result<OwnedBytes>>,
+    ) -> Result<OwnedBytes> {
+        self.data.get_or_try_init(|| fetch).await.cloned()
+    }
+}
+
+impl Debug for Footer {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("Footer")
+            .field("offset", &self.offset)
+            .finish_non_exhaustive()
     }
 }

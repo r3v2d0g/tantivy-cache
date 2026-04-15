@@ -1,9 +1,14 @@
-use std::{io, ops::Range, path::Path, sync::Arc};
+use std::{
+    io,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use block_on_place::HandleExt;
-use deadpool_redis::{Pool, redis::AsyncCommands};
-use eyre::Result;
+use deadpool_redis::{Connection, Pool, redis::AsyncCommands};
+use eyre::{OptionExt, Result};
 use tantivy::{
     Directory, HasLen,
     directory::{
@@ -20,6 +25,9 @@ mod error;
 mod footer;
 mod keys;
 
+#[cfg(test)]
+mod tests;
+
 /// A [`Directory`] implementation wrapping another one and caching some data using
 /// [`deadpool_redis`].
 #[derive(Clone, Debug)]
@@ -33,6 +41,10 @@ pub struct CachingDirectory<D> {
 struct CachingHandle {
     file: FileSlice,
     footer: Footer,
+
+    rt: Handle,
+    redis: Pool,
+    path: PathBuf,
 }
 
 impl<D> CachingDirectory<D> {
@@ -50,24 +62,66 @@ impl<D> CachingDirectory<D> {
         Self { rt, redis, dir }
     }
 
-    async fn open(&self, path: &Path, file: FileSlice) -> Result<CachingHandle> {
-        let key = keys::footer(path)?;
-        let mut conn = self.redis.get().await?;
+    async fn open(&self, path: impl Into<PathBuf>, file: FileSlice) -> Result<CachingHandle> {
+        let path = path.into();
 
-        if let Some(data) = conn.get(&key).await? {
-            let data: Vec<u8> = data;
-            let data = OwnedBytes::new(data);
-            let offset = file.len() - data.len();
-            let footer = Footer { data, offset };
+        if let Some(offset) = offset(&path, &self.redis).await {
+            let footer = Footer::with_offset(offset);
 
-            // TODO(MLB): cache in-memory as well?
-            return Ok(CachingHandle { file, footer });
+            let rt = self.rt.clone();
+            let redis = self.redis.clone();
+
+            return Ok(CachingHandle {
+                file,
+                footer,
+                rt,
+                redis,
+                path,
+            });
         }
 
-        let footer = Footer::read(path, &file).await?;
-        let () = conn.set(&key, footer.data.as_slice()).await?;
+        let footer = Footer::read(&path, &file).await?;
+        update(&path, &footer, &self.redis).await;
 
-        Ok(CachingHandle { file, footer })
+        let rt = self.rt.clone();
+        let redis = self.redis.clone();
+
+        Ok(CachingHandle {
+            file,
+            footer,
+            rt,
+            redis,
+            path,
+        })
+    }
+}
+
+impl CachingHandle {
+    /// Fetches the file's footer.
+    ///
+    /// If the footer has already been fetched, this simply returns it. If it is stored
+    /// in Redis, it fetches it from there. Otherwsie, it reads it and stores it in
+    /// Redis.
+    async fn footer(&self) -> Option<OwnedBytes> {
+        let fetch = async {
+            if let Some(data) = footer(&self.path, &self.redis).await {
+                return Ok(OwnedBytes::new(data));
+            }
+
+            let footer = Footer::read(&self.path, &self.file).await?;
+            update(&self.path, &footer, &self.redis).await;
+
+            footer.data().ok_or_eyre("missing data")
+        };
+
+        match self.footer.get_or_fetch(fetch).await {
+            Ok(footer) => Some(footer),
+            Err(error) => {
+                tracing::warn!("Failed to fetch footer: {error:?}");
+
+                None
+            }
+        }
     }
 }
 
@@ -141,10 +195,14 @@ impl FileHandle for CachingHandle {
             return self.file.read_bytes_slice(range);
         }
 
+        let Some(footer) = self.rt.block_on_place(self.footer()) else {
+            return self.file.read_bytes_slice(range);
+        };
+
         if range.start >= self.footer.offset {
             let start = range.start - self.footer.offset;
             let end = range.end - self.footer.offset;
-            let slice = self.footer.data.slice(start..end);
+            let slice = footer.slice(start..end);
 
             return Ok(slice);
         }
@@ -155,7 +213,7 @@ impl FileHandle for CachingHandle {
 
         let start = 0;
         let end = range.end - self.footer.offset;
-        let footer = self.footer.data.slice(start..end);
+        let footer = footer.slice(start..end);
 
         let mut combined = Vec::with_capacity(data.len() + footer.len());
         combined.extend_from_slice(data.as_ref());
@@ -169,10 +227,14 @@ impl FileHandle for CachingHandle {
             return self.file.read_bytes_slice_async(range).await;
         }
 
+        let Some(footer) = self.footer().await else {
+            return self.file.read_bytes_slice_async(range).await;
+        };
+
         if range.start >= self.footer.offset {
             let start = range.start - self.footer.offset;
             let end = range.end - self.footer.offset;
-            let slice = self.footer.data.slice(start..end);
+            let slice = footer.slice(start..end);
 
             return Ok(slice);
         }
@@ -183,7 +245,7 @@ impl FileHandle for CachingHandle {
 
         let start = 0;
         let end = range.end - self.footer.offset;
-        let footer = self.footer.data.slice(start..end);
+        let footer = footer.slice(start..end);
 
         let mut combined = Vec::with_capacity(data.len() + footer.len());
         combined.extend_from_slice(data.as_ref());
@@ -205,5 +267,73 @@ impl HasLen for CachingHandle {
     }
 }
 
-#[cfg(test)]
-mod tests;
+/// Gets a connection from the given Redis pool.
+///
+/// If an error occurs, this returns `None` and logs the error message.
+async fn conn(redis: &Pool) -> Option<Connection> {
+    match redis.get().await {
+        Ok(conn) => Some(conn),
+        Err(error) => {
+            tracing::warn!("Failed to get Redis connection: {error:?}");
+            None
+        }
+    }
+}
+
+/// Fetches the footer offset for the given path from Redis.
+///
+/// If an error occurs, this returns `None` and logs the error message.
+async fn offset(path: &Path, redis: &Pool) -> Option<usize> {
+    let key = keys::offset(&path).ok()?;
+    let mut conn = conn(redis).await?;
+
+    match conn.get(&key).await {
+        Ok(offset) => offset,
+        Err(error) => {
+            tracing::warn!("Failed to fetch footer offset: {error:?}");
+            return None;
+        }
+    }
+}
+
+/// Fetches the footer data for the given path from Redis.
+///
+/// If an error occurs, this returns `None` and logs the error message.
+async fn footer(path: &Path, redis: &Pool) -> Option<Vec<u8>> {
+    let key = keys::footer(&path).ok()?;
+    let mut conn = conn(redis).await?;
+
+    match conn.get(&key).await {
+        Ok(offset) => offset,
+        Err(error) => {
+            tracing::warn!("Failed to fetch footer: {error:?}");
+            return None;
+        }
+    }
+}
+
+/// Updates the cached data for the given footer in Redis.
+///
+/// If an error occurs, this returns `None` and logs the error message.
+async fn update(path: &Path, footer: &Footer, redis: &Pool) {
+    let Some(mut conn) = conn(redis).await else {
+        return;
+    };
+
+    let Ok(key) = keys::offset(&path) else { return };
+    match conn.set(&key, footer.offset).await {
+        Ok(()) => (),
+        Err(error) => {
+            tracing::warn!("Failed to update footer offset: {error:?}");
+        }
+    }
+
+    let Ok(key) = keys::footer(&path) else { return };
+    let Some(data) = footer.data() else { return };
+    match conn.set(&key, data.as_slice()).await {
+        Ok(()) => (),
+        Err(error) => {
+            tracing::warn!("Failed to update footer: {error:?}");
+        }
+    }
+}
